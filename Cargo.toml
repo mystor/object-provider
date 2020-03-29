@@ -3,5 +3,7 @@ name = "object-provider"
 version = "0.1.0"
 authors = ["Nika Layzell <nika@thelayzells.com>"]
 edition = "2018"
+description = "Trait for requesting values by type from a given object"
+repository = "https://github.com/mystor/object-provider"
 
 [dependencies]
