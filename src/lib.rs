@@ -1,4 +1,68 @@
 #![cfg_attr(not(test), no_std)]
+//! Trait for requesting values by type from a given object.
+//!
+//! # Examples
+//!
+//! ## Using a Provider
+//!
+//! ```
+//! # use object_provider::*;
+//! # use std::path::{Path, PathBuf};
+//! # use std::fmt::Debug;
+//! # struct MyProvider {
+//! #     path: PathBuf,
+//! # }
+//! # impl ObjectProvider for MyProvider {
+//! #     fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> Option<Request<'r, 'a>> {
+//! #         request
+//! #             .provide::<PathBuf>(&self.path)?
+//! #             .provide::<Path>(&self.path)?
+//! #             .provide::<dyn Debug>(&self.path)
+//! #     }
+//! # }
+//! # let my_path = Path::new("hello/world");
+//! # let my_provider = MyProvider { path: my_path.to_owned() };
+//! let provider: &dyn ObjectProvider;
+//! # provider = &my_provider;
+//!
+//! // It's possible to request concrete types like `PathBuf`
+//! let path_buf = provider.request::<PathBuf>().unwrap();
+//! assert_eq!(path_buf, my_path);
+//!
+//! // Requesting `!Sized` types, like slices and trait objects, is also supported.
+//! let path = provider.request::<Path>().unwrap();
+//! assert_eq!(path, my_path);
+//!
+//! let debug = provider.request::<dyn Debug>().unwrap();
+//! assert_eq!(
+//!     format!("{:?}", debug),
+//!     format!("{:?}", my_path),
+//! );
+//!
+//! // Types or interfaces not explicitly provided return `None`.
+//! assert!(provider.request::<i32>().is_none());
+//! assert!(provider.request::<dyn AsRef<Path>>().is_none());
+//! ```
+//!
+//! ## Implementing a Provider
+//!
+//! ```
+//! # use object_provider::*;
+//! # use std::path::{Path, PathBuf};
+//! # use std::fmt::Debug;
+//! struct MyProvider {
+//!     path: PathBuf,
+//! }
+//!
+//! impl ObjectProvider for MyProvider {
+//!     fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> Option<Request<'r, 'a>> {
+//!         request
+//!             .provide::<PathBuf>(&self.path)?
+//!             .provide::<Path>(&self.path)?
+//!             .provide::<dyn Debug>(&self.path)
+//!     }
+//! }
+//! ```
 
 use core::any::TypeId;
 use core::cell::Cell;
@@ -7,51 +71,43 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 /// A dynamic request for an object based on its type.
+///
+/// `'r` is the lifetime of request, and `'out` is the lifetime of the requested
+/// reference.
 pub struct Request<'r, 'out> {
     buf: NonNull<TypeId>,
     _marker: PhantomData<&'r mut &'out Cell<()>>,
 }
 
 impl<'r, 'out> Request<'r, 'out> {
-    /// Get the type of reference which can be provided in response to this
-    /// `Request`.
-    pub fn type_id(&self) -> TypeId {
-        unsafe { *self.buf.as_ref() }
-    }
-
-    /// Tries to provide an object of type `T` in response to this request.
+    /// Provides an object of type `T` in response to this request.
     ///
     /// Returns `None` if the value was successfully provided, and `Some(self)`
-    /// if there was a type mismatch.
+    /// if `T` was not the type being requested.
     ///
     /// This method can be chained within `provide` implementations to concisely
     /// provide multiple objects.
-    ///
-    /// # Panic
-    ///
-    /// This method will panic if a value has already been provided.
-    pub fn try_provide<T: ?Sized + 'static>(self, value: &'out T) -> Option<Self> {
-        self.try_provide_with(|| value)
+    pub fn provide<T: ?Sized + 'static>(self, value: &'out T) -> Option<Self> {
+        self.provide_with(|| value)
     }
 
-    /// Tries to provide an object of type `T` in response to this request.
+    /// Lazily provides an object of type `T` in response to this request.
     ///
     /// Returns `None` if the value was successfully provided, and `Some(self)`
-    /// if there was a type mismatch.
+    /// if `T` was not the type being requested.
+    ///
+    /// The passed closure is only called if the value will be successfully
+    /// provided.
     ///
     /// This method can be chained within `provide` implementations to concisely
     /// provide multiple objects.
-    ///
-    /// # Panic
-    ///
-    /// This method will panic if a value has already been provided.
-    pub fn try_provide_with<T: ?Sized + 'static, F>(mut self, cb: F) -> Option<Self>
+    pub fn provide_with<T: ?Sized + 'static, F>(mut self, cb: F) -> Option<Self>
     where
         F: FnOnce() -> &'out T,
     {
-        match self.downcast::<T>() {
+        match self.downcast_buf::<T>() {
             Some(this) => {
-                assert!(this.value.is_none(), "a value has already been provided");
+                debug_assert!(this.value.is_none(), "Multiple requests to a `RequestBuf` were acquired?");
                 this.value = Some(cb());
                 None
             }
@@ -59,13 +115,23 @@ impl<'r, 'out> Request<'r, 'out> {
         }
     }
 
+    /// Get the `TypeId` of the requested type.
+    pub fn type_id(&self) -> TypeId {
+        unsafe { *self.buf.as_ref() }
+    }
+
+    /// Returns `true` if the requested type is the same as `T`
+    pub fn is<T: ?Sized + 'static>(&self) -> bool {
+        self.type_id() == TypeId::of::<T>()
+    }
+
     /// Try to downcast this `Request` into a reference to the typed
     /// `RequestBuf` object.
     ///
     /// This method will return `None` if `self` was not derived from a
     /// `RequestBuf<'_, T>`.
-    pub(crate) fn downcast<T: ?Sized + 'static>(&mut self) -> Option<&mut RequestBuf<'out, T>> {
-        if self.type_id() == TypeId::of::<T>() {
+    fn downcast_buf<T: ?Sized + 'static>(&mut self) -> Option<&mut RequestBuf<'out, T>> {
+        if self.is::<T>() {
             unsafe { Some(&mut *(self.buf.as_ptr() as *mut RequestBuf<'out, T>)) }
         } else {
             None
@@ -77,7 +143,7 @@ impl<'r, 'out> Request<'r, 'out> {
     ///
     /// The `ObjectProviderExt` trait provides helper methods specifically for
     /// types implementing `ObjectProvider`.
-    pub fn with_request<T: ?Sized + 'static, F>(f: F) -> Option<&'out T>
+    pub fn with<T: ?Sized + 'static, F>(f: F) -> Option<&'out T>
     where
         for<'a> F: FnOnce(Request<'a, 'out>) -> Option<Request<'a, 'out>>,
     {
@@ -135,7 +201,7 @@ pub trait ObjectProviderExt {
 
 impl<O: ?Sized + ObjectProvider> ObjectProviderExt for O {
     fn request<T: ?Sized + 'static>(&self) -> Option<&T> {
-        Request::with_request::<T, _>(|req| self.provide(req))
+        Request::with::<T, _>(|req| self.provide(req))
     }
 }
 
@@ -153,9 +219,9 @@ mod test {
         impl ObjectProvider for HasContext {
             fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> Option<Request<'r, 'a>> {
                 request
-                    .try_provide::<i32>(&self.int)?
-                    .try_provide::<Path>(&self.path)?
-                    .try_provide::<dyn fmt::Display>(&self.int)
+                    .provide::<i32>(&self.int)?
+                    .provide::<Path>(&self.path)?
+                    .provide::<dyn fmt::Display>(&self.int)
             }
         }
 
