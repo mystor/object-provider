@@ -13,7 +13,7 @@
 //! #     path: PathBuf,
 //! # }
 //! # impl ObjectProvider for MyProvider {
-//! #     fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> Option<Request<'r, 'a>> {
+//! #     fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> ProvideResult<'r, 'a> {
 //! #         request
 //! #             .provide::<PathBuf>(&self.path)?
 //! #             .provide::<Path>(&self.path)?
@@ -55,7 +55,7 @@
 //! }
 //!
 //! impl ObjectProvider for MyProvider {
-//!     fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> Option<Request<'r, 'a>> {
+//!     fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> ProvideResult<'r, 'a> {
 //!         request
 //!             .provide::<PathBuf>(&self.path)?
 //!             .provide::<Path>(&self.path)?
@@ -82,26 +82,26 @@ pub struct Request<'r, 'out> {
 impl<'r, 'out> Request<'r, 'out> {
     /// Provides an object of type `T` in response to this request.
     ///
-    /// Returns `None` if the value was successfully provided, and `Some(self)`
-    /// if `T` was not the type being requested.
+    /// Returns `Err(FulfilledRequest)` if the value was successfully provided,
+    /// and `Ok(self)` if `T` was not the type being requested.
     ///
-    /// This method can be chained within `provide` implementations to concisely
-    /// provide multiple objects.
-    pub fn provide<T: ?Sized + 'static>(self, value: &'out T) -> Option<Self> {
+    /// This method can be chained within `provide` implementations using the
+    /// `?` operator to concisely provide multiple objects.
+    pub fn provide<T: ?Sized + 'static>(self, value: &'out T) -> ProvideResult<'r, 'out> {
         self.provide_with(|| value)
     }
 
     /// Lazily provides an object of type `T` in response to this request.
     ///
-    /// Returns `None` if the value was successfully provided, and `Some(self)`
-    /// if `T` was not the type being requested.
+    /// Returns `Err(FulfilledRequest)` if the value was successfully provided,
+    /// and `Ok(self)` if `T` was not the type being requested.
     ///
     /// The passed closure is only called if the value will be successfully
     /// provided.
     ///
-    /// This method can be chained within `provide` implementations to concisely
-    /// provide multiple objects.
-    pub fn provide_with<T: ?Sized + 'static, F>(mut self, cb: F) -> Option<Self>
+    /// This method can be chained within `provide` implementations using the
+    /// `?` operator to concisely provide multiple objects.
+    pub fn provide_with<T: ?Sized + 'static, F>(mut self, cb: F) -> ProvideResult<'r, 'out>
     where
         F: FnOnce() -> &'out T,
     {
@@ -109,9 +109,9 @@ impl<'r, 'out> Request<'r, 'out> {
             Some(this) => {
                 debug_assert!(this.value.is_none(), "Multiple requests to a `RequestBuf` were acquired?");
                 this.value = Some(cb());
-                None
+                Err(FulfilledRequest(PhantomData))
             }
-            None => Some(self),
+            None => Ok(self),
         }
     }
 
@@ -145,13 +145,13 @@ impl<'r, 'out> Request<'r, 'out> {
     /// types implementing `ObjectProvider`.
     pub fn with<T: ?Sized + 'static, F>(f: F) -> Option<&'out T>
     where
-        for<'a> F: FnOnce(Request<'a, 'out>) -> Option<Request<'a, 'out>>,
+        for<'a> F: FnOnce(Request<'a, 'out>) -> ProvideResult<'a, 'out>,
     {
         let mut buf = RequestBuf {
             type_id: TypeId::of::<T>(),
             value: None,
         };
-        f(Request {
+        let _ = f(Request {
             buf: unsafe {
                 NonNull::new_unchecked(&mut buf as *mut RequestBuf<'out, T> as *mut TypeId)
             },
@@ -176,24 +176,18 @@ struct RequestBuf<'a, T: ?Sized> {
     value: Option<&'a T>,
 }
 
-/// An object which can provide other objects based on the requested type.
+/// Trait to provide other objects based on a requested type at runtime.
 ///
-/// # Object Safety
-///
-/// The type of the passed-in request is erased using the `Request` type,
-/// meaning this trait is object-safe.
+/// See also the [`ObjectProviderExt`] trait which provides the `request` method.
 pub trait ObjectProvider {
     /// Provide an object of a given type in response to an untyped request.
     ///
-    /// Returns `None` when a value has been `provide`-ed to the `request`, and
-    /// `Some(request)` if the request hasn't been fulfilled yet.
-    ///
-    /// Consumers generally won't want to call this method. Instead use the
-    /// [`ObjectProviderExt::request`] method.
-    fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> Option<Request<'r, 'a>>;
+    /// Returns either `Err(FulfilledRequest)` if the request has been
+    /// fulfilled, or `Ok(Request)` if the request could not be fulfilled.
+    fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> ProvideResult<'r, 'a>;
 }
 
-/// Common extension methods implemented for all `ObjectProvider` instances.
+/// Methods supported by all [`ObjectProvider`] implementors.
 pub trait ObjectProviderExt {
     /// Request an object of type `T` from an object provider.
     fn request<T: ?Sized + 'static>(&self) -> Option<&T>;
@@ -204,6 +198,15 @@ impl<O: ?Sized + ObjectProvider> ObjectProviderExt for O {
         Request::with::<T, _>(|req| self.provide(req))
     }
 }
+
+/// Marker type indicating a request has been fulfilled.
+pub struct FulfilledRequest(PhantomData<&'static Cell<()>>);
+
+/// Provider method return type.
+///
+/// Either `Ok(Request)` for an unfulfilled request, or `Err(FulfilledRequest)`
+/// if the request was fulfilled.
+pub type ProvideResult<'r, 'a> = Result<Request<'r, 'a>, FulfilledRequest>;
 
 #[cfg(test)]
 mod test {
@@ -217,7 +220,7 @@ mod test {
             path: PathBuf,
         }
         impl ObjectProvider for HasContext {
-            fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> Option<Request<'r, 'a>> {
+            fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> ProvideResult<'r, 'a> {
                 request
                     .provide::<i32>(&self.int)?
                     .provide::<Path>(&self.path)?
