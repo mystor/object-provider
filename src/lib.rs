@@ -72,8 +72,6 @@ use core::marker::{PhantomData, PhantomPinned};
 use core::pin::Pin;
 
 /// A dynamic request for an object based on its type.
-///
-/// `'a` is the lifetime of the requested reference.
 #[repr(C)]
 pub struct Request<'a> {
     type_id: TypeId,
@@ -84,6 +82,9 @@ pub struct Request<'a> {
 impl<'a> Request<'a> {
     /// Provides an object of type `T` in response to this request.
     ///
+    /// If an object of type `T` has already been provided for this request, the
+    /// existing value will be replaced by the newly provided value.
+    ///
     /// This method can be chained within `provide` implementations to concisely
     /// provide multiple objects.
     pub fn provide<T: ?Sized + 'static>(self: Pin<&mut Self>, value: &'a T) -> Pin<&mut Self> {
@@ -91,6 +92,9 @@ impl<'a> Request<'a> {
     }
 
     /// Lazily provides an object of type `T` in response to this request.
+    ///
+    /// If an object of type `T` has already been provided for this request, the
+    /// existing value will be replaced by the newly provided value.
     ///
     /// The passed closure is only called if the value will be successfully
     /// provided.
@@ -102,10 +106,8 @@ impl<'a> Request<'a> {
         F: FnOnce() -> &'a T,
     {
         if let Some(buf) = self.as_mut().downcast_buf::<T>() {
-            debug_assert!(
-                buf.is_none(),
-                "Multiple requests to a `RequestBuf` were acquired?"
-            );
+            // NOTE: We could've already provided a value here of type `T`,
+            // which will be clobbered in this case.
             *buf = Some(cb());
         }
         self
@@ -128,10 +130,10 @@ impl<'a> Request<'a> {
     /// `RequestBuf<'_, T>`.
     fn downcast_buf<T: ?Sized + 'static>(self: Pin<&mut Self>) -> Option<&mut Option<&'a T>> {
         if self.is::<T>() {
+            // Safety: `self` is pinned, meaning it exists as the first
+            // field within our `RequestBuf`. As the type matches, this
+            // downcast is sound.
             unsafe {
-                // Safety: `self` is pinned, meaning it exists as the first
-                // field within our `RequestBuf`. As the type matches, this
-                // downcast is sound.
                 let ptr = self.get_unchecked_mut() as *mut Self as *mut RequestBuf<'a, T>;
                 Some(&mut (*ptr).value)
             }
@@ -149,19 +151,11 @@ impl<'a> Request<'a> {
     where
         F: FnOnce(Pin<&mut Request<'a>>),
     {
-        let mut buf = RequestBuf {
-            request: Request {
-                type_id: TypeId::of::<T>(),
-                _pinned: PhantomPinned,
-                _marker: PhantomData,
-            },
-            value: None,
-        };
-        unsafe {
-            // safety: We never move `buf` or `buf.request`.
-            f(Pin::new_unchecked(&mut buf.request));
-        }
-        buf.value
+        let mut buf = RequestBuf::new();
+        // safety: We never move `buf` after creating `pinned`.
+        let mut pinned = unsafe { Pin::new_unchecked(&mut buf) };
+        f(pinned.as_mut().request());
+        pinned.take()
     }
 }
 
@@ -173,11 +167,51 @@ impl<'a> fmt::Debug for Request<'a> {
     }
 }
 
+/// Low level buffer API used to create typed object requests.
+///
+/// Due to a heavy dependency on [`Pin`], this type is inconvenient to use
+/// directly. Prefer using the [`ObjectProviderExt`] trait and [`Request::with`]
+/// APIs when possible.
 // Needs to have a known layout so we can do unsafe pointer shenanigans.
 #[repr(C)]
-struct RequestBuf<'a, T: ?Sized> {
+#[derive(Debug)]
+pub struct RequestBuf<'a, T: ?Sized + 'static> {
     request: Request<'a>,
     value: Option<&'a T>,
+}
+
+impl<'a, T: ?Sized + 'static> RequestBuf<'a, T> {
+    /// Create a new `RequestBuf` object.
+    ///
+    /// This type must be pinned before it can be used.
+    pub fn new() -> Self {
+        RequestBuf {
+            request: Request {
+                type_id: TypeId::of::<T>(),
+                _pinned: PhantomPinned,
+                _marker: PhantomData,
+            },
+            value: None,
+        }
+    }
+
+    /// Get the untyped `Request` reference for this `RequestBuf`.
+    pub fn request(self: Pin<&mut Self>) -> Pin<&mut Request<'a>> {
+        // safety: projecting Pin onto our `request` field.
+        unsafe { self.map_unchecked_mut(|this| &mut this.request) }
+    }
+
+    /// Take a value previously provided to this `RequestBuf`.
+    pub fn take(self: Pin<&mut Self>) -> Option<&'a T> {
+        // safety: `Option<&'a T>` is `Unpin`
+        unsafe { self.get_unchecked_mut().value.take() }
+    }
+}
+
+impl<'a, T: ?Sized + 'static> Default for RequestBuf<'a, T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Trait to provide other objects based on a requested type at runtime.
