@@ -9,15 +9,16 @@
 //! # use object_provider::*;
 //! # use std::path::{Path, PathBuf};
 //! # use std::fmt::Debug;
+//! # use std::pin::Pin;
 //! # struct MyProvider {
 //! #     path: PathBuf,
 //! # }
 //! # impl ObjectProvider for MyProvider {
-//! #     fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> ProvideResult<'r, 'a> {
+//! #     fn provide<'a>(&'a self, request: Pin<&mut Request<'a>>) {
 //! #         request
-//! #             .provide::<PathBuf>(&self.path)?
-//! #             .provide::<Path>(&self.path)?
-//! #             .provide::<dyn Debug>(&self.path)
+//! #             .provide::<PathBuf>(&self.path)
+//! #             .provide::<Path>(&self.path)
+//! #             .provide::<dyn Debug>(&self.path);
 //! #     }
 //! # }
 //! # let my_path = Path::new("hello/world");
@@ -50,74 +51,69 @@
 //! # use object_provider::*;
 //! # use std::path::{Path, PathBuf};
 //! # use std::fmt::Debug;
+//! # use std::pin::Pin;
 //! struct MyProvider {
 //!     path: PathBuf,
 //! }
 //!
 //! impl ObjectProvider for MyProvider {
-//!     fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> ProvideResult<'r, 'a> {
+//!     fn provide<'a>(&'a self, request: Pin<&mut Request<'a>>) {
 //!         request
-//!             .provide::<PathBuf>(&self.path)?
-//!             .provide::<Path>(&self.path)?
-//!             .provide::<dyn Debug>(&self.path)
+//!             .provide::<PathBuf>(&self.path)
+//!             .provide::<Path>(&self.path)
+//!             .provide::<dyn Debug>(&self.path);
 //!     }
 //! }
 //! ```
 
 use core::any::TypeId;
-use core::cell::Cell;
 use core::fmt;
-use core::marker::PhantomData;
-use core::ptr::NonNull;
+use core::marker::{PhantomData, PhantomPinned};
+use core::pin::Pin;
 
 /// A dynamic request for an object based on its type.
 ///
-/// `'r` is the lifetime of request, and `'out` is the lifetime of the requested
-/// reference.
-pub struct Request<'r, 'out> {
-    buf: NonNull<TypeId>,
-    _marker: PhantomData<&'r mut &'out Cell<()>>,
+/// `'out` is the lifetime of the requested reference.
+#[repr(C)]
+pub struct Request<'out> {
+    type_id: TypeId,
+    _pinned: PhantomPinned,
+    _marker: PhantomData<&'out ()>,
 }
 
-impl<'r, 'out> Request<'r, 'out> {
+impl<'out> Request<'out> {
     /// Provides an object of type `T` in response to this request.
     ///
-    /// Returns `Err(FulfilledRequest)` if the value was successfully provided,
-    /// and `Ok(self)` if `T` was not the type being requested.
-    ///
-    /// This method can be chained within `provide` implementations using the
-    /// `?` operator to concisely provide multiple objects.
-    pub fn provide<T: ?Sized + 'static>(self, value: &'out T) -> ProvideResult<'r, 'out> {
+    /// This method can be chained within `provide` implementations to concisely
+    /// provide multiple objects.
+    pub fn provide<T: ?Sized + 'static>(self: Pin<&mut Self>, value: &'out T) -> Pin<&mut Self> {
         self.provide_with(|| value)
     }
 
     /// Lazily provides an object of type `T` in response to this request.
     ///
-    /// Returns `Err(FulfilledRequest)` if the value was successfully provided,
-    /// and `Ok(self)` if `T` was not the type being requested.
-    ///
     /// The passed closure is only called if the value will be successfully
     /// provided.
     ///
-    /// This method can be chained within `provide` implementations using the
-    /// `?` operator to concisely provide multiple objects.
-    pub fn provide_with<T: ?Sized + 'static, F>(mut self, cb: F) -> ProvideResult<'r, 'out>
+    /// This method can be chained within `provide` implementations to concisely
+    /// provide multiple objects.
+    pub fn provide_with<T: ?Sized + 'static, F>(mut self: Pin<&mut Self>, cb: F) -> Pin<&mut Self>
     where
         F: FnOnce() -> &'out T,
     {
-        match self.downcast_buf::<T>() {
-            Some(this) => {
-                debug_assert!(this.value.is_none(), "Multiple requests to a `RequestBuf` were acquired?");
-                this.value = Some(cb());
-                Err(FulfilledRequest(PhantomData))
-            }
-            None => Ok(self),
+        if let Some(buf) = self.as_mut().downcast_buf::<T>() {
+            debug_assert!(
+                buf.is_none(),
+                "Multiple requests to a `RequestBuf` were acquired?"
+            );
+            *buf = Some(cb());
         }
+        self
     }
 
     /// Get the `TypeId` of the requested type.
     pub fn type_id(&self) -> TypeId {
-        unsafe { *self.buf.as_ref() }
+        self.type_id
     }
 
     /// Returns `true` if the requested type is the same as `T`
@@ -126,13 +122,19 @@ impl<'r, 'out> Request<'r, 'out> {
     }
 
     /// Try to downcast this `Request` into a reference to the typed
-    /// `RequestBuf` object.
+    /// `RequestBuf` object, and access the trailing `Option<&'out T>`.
     ///
-    /// This method will return `None` if `self` was not derived from a
+    /// This method will return `None` if `self` is not the prefix of a
     /// `RequestBuf<'_, T>`.
-    fn downcast_buf<T: ?Sized + 'static>(&mut self) -> Option<&mut RequestBuf<'out, T>> {
+    fn downcast_buf<T: ?Sized + 'static>(self: Pin<&mut Self>) -> Option<&mut Option<&'out T>> {
         if self.is::<T>() {
-            unsafe { Some(&mut *(self.buf.as_ptr() as *mut RequestBuf<'out, T>)) }
+            unsafe {
+                // Safety: `self` is pinned, meaning it exists as the first
+                // field within our `RequestBuf`. As the type matches, this
+                // downcast is sound.
+                let ptr = self.get_unchecked_mut() as *mut Self as *mut RequestBuf<'out, T>;
+                Some(&mut (*ptr).value)
+            }
         } else {
             None
         }
@@ -145,23 +147,25 @@ impl<'r, 'out> Request<'r, 'out> {
     /// types implementing `ObjectProvider`.
     pub fn with<T: ?Sized + 'static, F>(f: F) -> Option<&'out T>
     where
-        for<'a> F: FnOnce(Request<'a, 'out>) -> ProvideResult<'a, 'out>,
+        F: FnOnce(Pin<&mut Request<'out>>),
     {
         let mut buf = RequestBuf {
-            type_id: TypeId::of::<T>(),
+            request: Request {
+                type_id: TypeId::of::<T>(),
+                _pinned: PhantomPinned,
+                _marker: PhantomData,
+            },
             value: None,
         };
-        let _ = f(Request {
-            buf: unsafe {
-                NonNull::new_unchecked(&mut buf as *mut RequestBuf<'out, T> as *mut TypeId)
-            },
-            _marker: PhantomData,
-        });
+        unsafe {
+            // safety: We never move `buf` or `buf.request`.
+            f(Pin::new_unchecked(&mut buf.request));
+        }
         buf.value
     }
 }
 
-impl<'r, 'out> fmt::Debug for Request<'r, 'out> {
+impl<'out> fmt::Debug for Request<'out> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Request")
             .field("type_id", &self.type_id())
@@ -172,7 +176,7 @@ impl<'r, 'out> fmt::Debug for Request<'r, 'out> {
 // Needs to have a known layout so we can do unsafe pointer shenanigans.
 #[repr(C)]
 struct RequestBuf<'a, T: ?Sized> {
-    type_id: TypeId,
+    request: Request<'a>,
     value: Option<&'a T>,
 }
 
@@ -184,7 +188,7 @@ pub trait ObjectProvider {
     ///
     /// Returns either `Err(FulfilledRequest)` if the request has been
     /// fulfilled, or `Ok(Request)` if the request could not be fulfilled.
-    fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> ProvideResult<'r, 'a>;
+    fn provide<'a>(&'a self, request: Pin<&mut Request<'a>>);
 }
 
 /// Methods supported by all [`ObjectProvider`] implementors.
@@ -199,15 +203,6 @@ impl<O: ?Sized + ObjectProvider> ObjectProviderExt for O {
     }
 }
 
-/// Marker type indicating a request has been fulfilled.
-pub struct FulfilledRequest(PhantomData<&'static Cell<()>>);
-
-/// Provider method return type.
-///
-/// Either `Ok(Request)` for an unfulfilled request, or `Err(FulfilledRequest)`
-/// if the request was fulfilled.
-pub type ProvideResult<'r, 'a> = Result<Request<'r, 'a>, FulfilledRequest>;
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -220,11 +215,11 @@ mod test {
             path: PathBuf,
         }
         impl ObjectProvider for HasContext {
-            fn provide<'r, 'a>(&'a self, request: Request<'r, 'a>) -> ProvideResult<'r, 'a> {
+            fn provide<'a>(&'a self, request: Pin<&mut Request<'a>>) {
                 request
-                    .provide::<i32>(&self.int)?
-                    .provide::<Path>(&self.path)?
-                    .provide::<dyn fmt::Display>(&self.int)
+                    .provide::<i32>(&self.int)
+                    .provide::<Path>(&self.path)
+                    .provide::<dyn fmt::Display>(&self.int);
             }
         }
 
