@@ -73,20 +73,20 @@ use core::pin::Pin;
 
 /// A dynamic request for an object based on its type.
 ///
-/// `'out` is the lifetime of the requested reference.
+/// `'a` is the lifetime of the requested reference.
 #[repr(C)]
-pub struct Request<'out> {
+pub struct Request<'a> {
     type_id: TypeId,
     _pinned: PhantomPinned,
-    _marker: PhantomData<&'out ()>,
+    _marker: PhantomData<&'a ()>,
 }
 
-impl<'out> Request<'out> {
+impl<'a> Request<'a> {
     /// Provides an object of type `T` in response to this request.
     ///
     /// This method can be chained within `provide` implementations to concisely
     /// provide multiple objects.
-    pub fn provide<T: ?Sized + 'static>(self: Pin<&mut Self>, value: &'out T) -> Pin<&mut Self> {
+    pub fn provide<T: ?Sized + 'static>(self: Pin<&mut Self>, value: &'a T) -> Pin<&mut Self> {
         self.provide_with(|| value)
     }
 
@@ -99,7 +99,7 @@ impl<'out> Request<'out> {
     /// provide multiple objects.
     pub fn provide_with<T: ?Sized + 'static, F>(mut self: Pin<&mut Self>, cb: F) -> Pin<&mut Self>
     where
-        F: FnOnce() -> &'out T,
+        F: FnOnce() -> &'a T,
     {
         if let Some(buf) = self.as_mut().downcast_buf::<T>() {
             debug_assert!(
@@ -122,17 +122,17 @@ impl<'out> Request<'out> {
     }
 
     /// Try to downcast this `Request` into a reference to the typed
-    /// `RequestBuf` object, and access the trailing `Option<&'out T>`.
+    /// `RequestBuf` object, and access the trailing `Option<&'a T>`.
     ///
     /// This method will return `None` if `self` is not the prefix of a
     /// `RequestBuf<'_, T>`.
-    fn downcast_buf<T: ?Sized + 'static>(self: Pin<&mut Self>) -> Option<&mut Option<&'out T>> {
+    fn downcast_buf<T: ?Sized + 'static>(self: Pin<&mut Self>) -> Option<&mut Option<&'a T>> {
         if self.is::<T>() {
             unsafe {
                 // Safety: `self` is pinned, meaning it exists as the first
                 // field within our `RequestBuf`. As the type matches, this
                 // downcast is sound.
-                let ptr = self.get_unchecked_mut() as *mut Self as *mut RequestBuf<'out, T>;
+                let ptr = self.get_unchecked_mut() as *mut Self as *mut RequestBuf<'a, T>;
                 Some(&mut (*ptr).value)
             }
         } else {
@@ -145,9 +145,9 @@ impl<'out> Request<'out> {
     ///
     /// The `ObjectProviderExt` trait provides helper methods specifically for
     /// types implementing `ObjectProvider`.
-    pub fn with<T: ?Sized + 'static, F>(f: F) -> Option<&'out T>
+    pub fn with<T: ?Sized + 'static, F>(f: F) -> Option<&'a T>
     where
-        F: FnOnce(Pin<&mut Request<'out>>),
+        F: FnOnce(Pin<&mut Request<'a>>),
     {
         let mut buf = RequestBuf {
             request: Request {
@@ -165,7 +165,7 @@ impl<'out> Request<'out> {
     }
 }
 
-impl<'out> fmt::Debug for Request<'out> {
+impl<'a> fmt::Debug for Request<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Request")
             .field("type_id", &self.type_id())
