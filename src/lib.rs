@@ -221,7 +221,7 @@ impl<'a> fmt::Debug for Request<'a> {
 // Needs to have a known layout so we can do unsafe pointer shenanigans.
 #[repr(C)]
 #[derive(Debug)]
-pub struct RequestBuf<'a, T> {
+struct RequestBuf<'a, T> {
     request: Request<'a>,
     value: Option<T>,
 }
@@ -230,7 +230,7 @@ impl<'a, T: ?Sized + 'static> RequestBuf<'a, &'a T> {
     /// Create a new `RequestBuf` object.
     ///
     /// This type must be pinned before it can be used.
-    pub fn for_ref() -> Self {
+    fn for_ref() -> Self {
         // safety: ReqRef is a marker type for `&'a T`
         unsafe { Self::new_internal(TypeId::of::<ReqRef<T>>()) }
     }
@@ -240,7 +240,7 @@ impl<'a, T: 'static> RequestBuf<'a, T> {
     /// Create a new `RequestBuf` object.
     ///
     /// This type must be pinned before it can be used.
-    pub fn for_value() -> Self {
+    fn for_value() -> Self {
         // safety: ReqVal is a marker type for `T`
         unsafe { Self::new_internal(TypeId::of::<ReqVal<T>>()) }
     }
@@ -259,13 +259,13 @@ impl<'a, T> RequestBuf<'a, T> {
     }
 
     /// Get the untyped `Request` reference for this `RequestBuf`.
-    pub fn request(self: Pin<&mut Self>) -> Pin<&mut Request<'a>> {
+    fn request(self: Pin<&mut Self>) -> Pin<&mut Request<'a>> {
         // safety: projecting Pin onto our `request` field.
         unsafe { self.map_unchecked_mut(|this| &mut this.request) }
     }
 
     /// Take a value previously provided to this `RequestBuf`.
-    pub fn take(self: Pin<&mut Self>) -> Option<T> {
+    fn take(self: Pin<&mut Self>) -> Option<T> {
         // safety: we don't project Pin onto our `value` field.
         unsafe { self.get_unchecked_mut().value.take() }
     }
