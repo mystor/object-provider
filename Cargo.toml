@@ -1,6 +1,6 @@
 [package]
 name = "object-provider"
-version = "0.2.0-pre1"
+version = "0.2.0"
 authors = ["Nika Layzell <nika@thelayzells.com>"]
 edition = "2018"
 description = "Trait for requesting values by type from a given object"
