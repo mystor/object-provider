@@ -261,7 +261,7 @@ impl<'a, T> RequestBuf<'a, T> {
     /// Get the untyped `Request` reference for this `RequestBuf`.
     fn request(self: Pin<&mut Self>) -> Pin<&mut Request<'a>> {
         // safety: projecting Pin onto our `request` field.
-        unsafe { self.map_unchecked_mut(|this| &mut this.request) }
+        unsafe { self.map_unchecked_mut(|this| &mut *(this as *mut Self as *mut Request<'a>)) }
     }
 
     /// Take a value previously provided to this `RequestBuf`.
