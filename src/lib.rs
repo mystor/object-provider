@@ -14,7 +14,7 @@
 //! #     path: PathBuf,
 //! # }
 //! # impl ObjectProvider for MyProvider {
-//! #     fn provide<'a>(&'a self, request: &mut dyn Request<'a>) {
+//! #     fn provide<'a>(&'a self, request: &mut Request<'a>) {
 //! #         request
 //! #             .provide_ref::<PathBuf>(&self.path)
 //! #             .provide_ref::<Path>(&self.path)
@@ -57,7 +57,7 @@
 //! }
 //!
 //! impl ObjectProvider for MyProvider {
-//!     fn provide<'a>(&'a self, request: &mut dyn Request<'a>) {
+//!     fn provide<'a>(&'a self, request: &mut Request<'a>) {
 //!         request
 //!             .provide_ref::<PathBuf>(&self.path)
 //!             .provide_ref::<Path>(&self.path)
@@ -67,71 +67,67 @@
 //! ```
 
 use core::any::TypeId;
-use core::ptr;
+use core::marker::PhantomData;
 
 mod private {
-    pub struct Private;
-    pub trait Sealed {}
+    pub trait Response {}
+    impl<T> Response for Option<T> {}
 }
+
+/// When used by `Request`, `TypeId::of::<RefMarker<T>>()` indicates that
+/// `response` is of type `Option<&'a T>`.
+struct RefMarker<T: ?Sized + 'static>(T);
+
+/// When used by `Request`, `TypeId::of::<ValueMarker<T>>()` indicates that
+/// `response` is of type `Option<T>`.
+struct ValueMarker<T: 'static>(T);
 
 /// A dynamic request for an object based on its type.
-pub unsafe trait Request<'a>: private::Sealed {
-    /// /!\ THIS IS NOT PUBLIC API /!\
-    ///
-    /// Provide a reference with the given type to the request.
-    ///
-    /// The returned pointer, if non-null, can be cast to point to an `Option<&'a T>`,
-    /// where `T` is the type `TypeId` was derived from.
-    ///
-    /// The lifetime of the returned pointer is the lifetime of `self`.
-    #[doc(hidden)]
-    fn provide_ref_internal(&mut self, _: private::Private, _type_id: TypeId) -> *mut () {
-        ptr::null_mut()
-    }
+pub struct Request<'a, R = dyn private::Response + 'a>
+where
+    R: ?Sized + private::Response,
+{
+    marker: PhantomData<&'a ()>,
 
-    /// /!\ THIS IS NOT PUBLIC API /!\
+    /// A `TypeId` marker for the type stored in `R`.
     ///
-    /// Provide a value with the given type to the request.
+    /// Will be the TypeId of either `RefMarker<T>` or `ValueMarker<T>`.
+    type_id: TypeId,
+
+    /// A (potentially type-erased) `Option<T>` containing the response value.
     ///
-    /// The returned pointer, if non-null, will point to an `Option<T>`, where
-    /// `T` is the type `TypeId` was derived from.
-    ///
-    /// The lifetime of the returned pointer is the lifetime of `self`.
-    #[doc(hidden)]
-    fn provide_value_internal(&mut self, _: private::Private, _type_id: TypeId) -> *mut () {
-        ptr::null_mut()
-    }
+    /// Will be either `Option<&'a T>` if `type_id` is `RefMarker<T>`, or
+    /// `Option<T>` if `type_id` is `ValueMarker<T>`.
+    response: R,
 }
 
-impl<'a> dyn Request<'a> + '_ {
-    /// Type-safe wrapper for calling `provide_ref_internal`.
-    ///
-    /// See `Request::provide_ref_internal`'s documentation for the invariants
-    /// being held by this method.
-    fn provide_ref_place<'b, T: ?Sized + 'static>(&'b mut self) -> Option<&'b mut Option<&'a T>> {
-        let ptr = self.provide_ref_internal(private::Private, TypeId::of::<T>());
-        if ptr.is_null() {
-            None
+impl<'a> Request<'a> {
+    /// Perform a checked downcast of `response` to `Option<&'a T>`
+    fn downcast_ref_response<'b, T: ?Sized + 'static>(
+        &'b mut self,
+    ) -> Option<&'b mut Option<&'a T>> {
+        if self.is_ref::<T>() {
+            // safety: If `self.is_ref::<T>()` returns true, `response` must be
+            // of the correct type. This is enforced by the private `type_id`
+            // field.
+            Some(unsafe { &mut *(&mut self.response as *mut _ as *mut Option<&'a T>) })
         } else {
-            Some(unsafe { &mut *(ptr as *mut Option<&'a T>) })
+            None
         }
     }
 
-    /// Type-safe wrapper for calling `provide_value_internal`.
-    ///
-    /// See `Request::provide_value_internal`'s documentation for the invariants
-    /// being held by this method.
-    fn provide_value_place<'b, T: 'static>(&'b mut self) -> Option<&'b mut Option<T>> {
-        let ptr = self.provide_value_internal(private::Private, TypeId::of::<T>());
-        if ptr.is_null() {
-            None
+    /// Perform a checked downcast of `response` to `Option<T>`
+    fn downcast_value_response<'b, T: 'static>(&'b mut self) -> Option<&'b mut Option<T>> {
+        if self.is_value::<T>() {
+            // safety: If `self.is_value::<T>()` returns true, `response` must
+            // be of the correct type. This is enforced by the private `type_id`
+            // field.
+            Some(unsafe { &mut *(&mut self.response as *mut _ as *mut Option<T>) })
         } else {
-            Some(unsafe { &mut *(ptr as *mut Option<T>) })
+            None
         }
     }
-}
 
-impl<'a> dyn Request<'a> + '_ {
     /// Provides a reference of type `&'a T` in response to this request.
     ///
     /// If a reference of type `&'a T` has already been provided for this
@@ -155,13 +151,12 @@ impl<'a> dyn Request<'a> + '_ {
     ///
     /// This method can be chained within `provide` implementations to concisely
     /// provide multiple objects.
-    pub fn provide_ref_with<T, F>(&mut self, cb: F) -> &mut Self
+    pub fn provide_ref_with<T: ?Sized + 'static, F>(&mut self, cb: F) -> &mut Self
     where
-        T: ?Sized + 'static,
         F: FnOnce() -> &'a T,
     {
-        if let Some(place) = self.provide_ref_place::<T>() {
-            *place = Some(cb());
+        if let Some(response) = self.downcast_ref_response::<T>() {
+            *response = Some(cb());
         }
         self
     }
@@ -187,15 +182,63 @@ impl<'a> dyn Request<'a> + '_ {
     ///
     /// This method can be chained within `provide` implementations to concisely
     /// provide multiple objects.
-    pub fn provide_value_with<T, F>(&mut self, cb: F) -> &mut Self
+    pub fn provide_value_with<T: 'static, F>(&mut self, cb: F) -> &mut Self
     where
-        T: 'static,
         F: FnOnce() -> T,
     {
-        if let Some(place) = self.provide_value_place::<T>() {
-            *place = Some(cb());
+        if let Some(response) = self.downcast_value_response::<T>() {
+            *response = Some(cb());
         }
         self
+    }
+
+    /// Returns `true` if the requested type is `&'a T`
+    pub fn is_ref<T: ?Sized + 'static>(&self) -> bool {
+        self.type_id == TypeId::of::<RefMarker<T>>()
+    }
+
+    /// Returns `true` if the requested type is `T`
+    pub fn is_value<T: 'static>(&self) -> bool {
+        self.type_id == TypeId::of::<ValueMarker<T>>()
+    }
+}
+
+impl<'a, T: ?Sized + 'static> Request<'a, Option<&'a T>> {
+    /// Create a new reference request object.
+    ///
+    /// The returned value will unsize to `Request<'a>`, and can be passed to
+    /// functions accepting it as an argument to request `&'a T` references.
+    pub fn new_ref() -> Self {
+        // safety: Initializes `type_id` to `RefMarker<T>`, which corresponds to
+        // the response type `Option<&'a T>`.
+        Request {
+            marker: PhantomData,
+            type_id: TypeId::of::<RefMarker<T>>(),
+            response: None,
+        }
+    }
+}
+
+impl<T: 'static> Request<'_, Option<T>> {
+    /// Create a new value request object.
+    ///
+    /// The returned value will unsize to `Request<'a>`, and can be passed to
+    /// functions accepting it as an argument to request `T` values.
+    pub fn new_value() -> Self {
+        // safety: Initializes `type_id` to `ValueMarker<T>`, which corresponds
+        // to the response type `Option<T>`.
+        Request {
+            marker: PhantomData,
+            type_id: TypeId::of::<ValueMarker<T>>(),
+            response: None,
+        }
+    }
+}
+
+impl<T> Request<'_, Option<T>> {
+    /// Extract the response from this request object, consuming it.
+    pub fn into_response(self) -> Option<T> {
+        self.response
     }
 }
 
@@ -205,7 +248,7 @@ impl<'a> dyn Request<'a> + '_ {
 /// `request_value` methods.
 pub trait ObjectProvider {
     /// Provide an object in response to `request`.
-    fn provide<'a>(&'a self, request: &mut dyn Request<'a>);
+    fn provide<'a>(&'a self, request: &mut Request<'a>);
 }
 
 /// Methods supported by all [`ObjectProvider`] implementors.
@@ -219,77 +262,15 @@ pub trait ObjectProviderExt {
 
 impl<O: ?Sized + ObjectProvider> ObjectProviderExt for O {
     fn request_ref<T: ?Sized + 'static>(&self) -> Option<&T> {
-        let mut request = RequestRef::default();
+        let mut request = Request::new_ref();
         self.provide(&mut request);
-        request.value
+        request.into_response()
     }
 
     fn request_value<T: 'static>(&self) -> Option<T> {
-        let mut request = RequestValue::default();
+        let mut request = Request::new_value();
         self.provide(&mut request);
-        request.value
-    }
-}
-
-/// A request for a reference of type `&'a T`.
-///
-/// This type implements `Request<'a>`, meaning it can be passed to types
-/// expecting `&mut dyn Request<'a>`.
-#[derive(Debug)]
-pub struct RequestRef<'a, T: ?Sized> {
-    /// The value provided to this request, or `None`.
-    pub value: Option<&'a T>,
-}
-
-impl<'a, T: ?Sized> Default for RequestRef<'a, T> {
-    fn default() -> Self {
-        RequestRef { value: None }
-    }
-}
-
-impl<'a, T: ?Sized + 'static> private::Sealed for RequestRef<'a, T> {}
-
-unsafe impl<'a, T: ?Sized + 'static> Request<'a> for RequestRef<'a, T> {
-    /// See `Request::provide_ref_internal`'s documentation for the invariants
-    /// being upheld by this method.
-    #[doc(hidden)]
-    fn provide_ref_internal(&mut self, _: private::Private, type_id: TypeId) -> *mut () {
-        if type_id == TypeId::of::<T>() {
-            &mut self.value as *mut Option<&'a T> as *mut ()
-        } else {
-            ptr::null_mut()
-        }
-    }
-}
-
-/// A request for a value of type `T`.
-///
-/// This type implements [`Request`], meaning it can be passed to functions
-/// expecting a `&mut dyn Request<'a>` trait object.
-#[derive(Debug)]
-pub struct RequestValue<T> {
-    /// The value provided to this request, or `None`.
-    pub value: Option<T>,
-}
-
-impl<T> Default for RequestValue<T> {
-    fn default() -> Self {
-        RequestValue { value: None }
-    }
-}
-
-impl<T: 'static> private::Sealed for RequestValue<T> {}
-
-unsafe impl<'a, T: 'static> Request<'a> for RequestValue<T> {
-    /// See `Request::provide_value_internal`'s documentation for the invariants
-    /// being upheld by this method.
-    #[doc(hidden)]
-    fn provide_value_internal(&mut self, _: private::Private, type_id: TypeId) -> *mut () {
-        if type_id == TypeId::of::<T>() {
-            &mut self.value as *mut Option<T> as *mut ()
-        } else {
-            ptr::null_mut()
-        }
+        request.into_response()
     }
 }
 
@@ -306,12 +287,13 @@ mod test {
             path: PathBuf,
         }
         impl ObjectProvider for HasContext {
-            fn provide<'a>(&'a self, request: &mut dyn Request<'a>) {
+            fn provide<'a>(&'a self, request: &mut Request<'a>) {
                 request
                     .provide_ref::<i32>(&self.int)
                     .provide_ref::<Path>(&self.path)
                     .provide_ref::<dyn fmt::Display>(&self.int)
-                    .provide_value::<i32>(self.int);
+                    .provide_value::<i32>(self.int)
+                    .provide_value_with::<i64, _>(|| self.int as i64);
             }
         }
 
