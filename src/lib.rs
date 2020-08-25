@@ -61,7 +61,10 @@
 //!         request
 //!             .provide_ref::<PathBuf>(&self.path)
 //!             .provide_ref::<Path>(&self.path)
-//!             .provide_ref::<dyn Debug>(&self.path);
+//!             .provide_ref::<dyn Debug>(&self.path)
+//!             .provide_value_with::<String, _>(|| {
+//!                 self.path.to_string_lossy().into_owned()
+//!             });
 //!     }
 //! }
 //! ```
@@ -131,11 +134,31 @@ impl<'a> Request<'a> {
     /// Provides a reference of type `&'a T` in response to this request.
     ///
     /// If a reference of type `&'a T` has already been provided for this
-    /// request, the existing value will be replaced by the newly provided
-    /// value.
+    /// request, or if the request is for a different type, this call will be
+    /// ignored.
     ///
     /// This method can be chained within `provide` implementations to concisely
     /// provide multiple objects.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use object_provider::{ObjectProvider, Request};
+    /// # use std::fmt;
+    /// struct MyProvider {
+    ///     name: String,
+    /// }
+    ///
+    /// impl ObjectProvider for MyProvider {
+    ///     fn provide<'a>(&'a self, request: &mut Request<'a>) {
+    ///         request
+    ///             .provide_ref::<Self>(&self)
+    ///             .provide_ref::<String>(&self.name)
+    ///             .provide_ref::<str>(&self.name)
+    ///             .provide_ref::<dyn fmt::Display>(&self.name);
+    ///     }
+    /// }
+    /// ```
     pub fn provide_ref<T: ?Sized + 'static>(&mut self, value: &'a T) -> &mut Self {
         self.provide_ref_with(|| value)
     }
@@ -143,19 +166,42 @@ impl<'a> Request<'a> {
     /// Lazily provides a reference of type `&'a T` in response to this request.
     ///
     /// If a reference of type `&'a T` has already been provided for this
-    /// request, the existing value will be replaced by the newly provided
-    /// value.
+    /// request, or if the request is for a different type, this call will be
+    /// ignored.
     ///
     /// The passed closure is only called if the value will be successfully
     /// provided.
     ///
     /// This method can be chained within `provide` implementations to concisely
     /// provide multiple objects.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use object_provider::{ObjectProvider, Request};
+    /// # fn expensive_condition() -> bool { true }
+    /// struct MyProvider {
+    ///     a: String,
+    ///     b: String,
+    /// }
+    ///
+    /// impl ObjectProvider for MyProvider {
+    ///     fn provide<'a>(&'a self, request: &mut Request<'a>) {
+    ///         request.provide_ref_with::<String, _>(|| {
+    ///             if expensive_condition() {
+    ///                 &self.a
+    ///             } else {
+    ///                 &self.b
+    ///             }
+    ///         });
+    ///     }
+    /// }
+    /// ```
     pub fn provide_ref_with<T: ?Sized + 'static, F>(&mut self, cb: F) -> &mut Self
     where
         F: FnOnce() -> &'a T,
     {
-        if let Some(response) = self.downcast_ref_response::<T>() {
+        if let Some(response @ None) = self.downcast_ref_response::<T>() {
             *response = Some(cb());
         }
         self
@@ -163,30 +209,64 @@ impl<'a> Request<'a> {
 
     /// Provides an value of type `T` in response to this request.
     ///
-    /// If a value of type `T` has already been provided for this request, the
-    /// existing value will be replaced by the newly provided value.
+    /// If a value of type `T` has already been provided for this request, or if
+    /// the request is for a different type, this call will be ignored.
     ///
     /// This method can be chained within `provide` implementations to concisely
     /// provide multiple objects.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use object_provider::{ObjectProvider, Request};
+    /// struct MyProvider {
+    ///     count: u32,
+    /// }
+    ///
+    /// impl ObjectProvider for MyProvider {
+    ///     fn provide<'a>(&'a self, request: &mut Request<'a>) {
+    ///         request
+    ///             .provide_value::<u32>(self.count)
+    ///             .provide_value::<&'static str>("hello, world!");
+    ///     }
+    /// }
+    /// ```
     pub fn provide_value<T: 'static>(&mut self, value: T) -> &mut Self {
         self.provide_value_with(|| value)
     }
 
     /// Lazily provides a value of type `T` in response to this request.
     ///
-    /// If a value of type `T` has already been provided for this request, the
-    /// existing value will be replaced by the newly provided value.
+    /// If a value of type `T` has already been provided for this request, or if
+    /// the request is for a different type, this call will be ignored.
     ///
     /// The passed closure is only called if the value will be successfully
     /// provided.
     ///
     /// This method can be chained within `provide` implementations to concisely
     /// provide multiple objects.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use object_provider::{ObjectProvider, Request};
+    /// struct MyProvider {
+    ///     count: u32,
+    /// }
+    ///
+    /// impl ObjectProvider for MyProvider {
+    ///     fn provide<'a>(&'a self, request: &mut Request<'a>) {
+    ///         request
+    ///             .provide_value_with::<u32, _>(|| self.count / 10)
+    ///             .provide_value_with::<String, _>(|| format!("{}", self.count));
+    ///     }
+    /// }
+    /// ```
     pub fn provide_value_with<T: 'static, F>(&mut self, cb: F) -> &mut Self
     where
         F: FnOnce() -> T,
     {
-        if let Some(response) = self.downcast_value_response::<T>() {
+        if let Some(response @ None) = self.downcast_value_response::<T>() {
             *response = Some(cb());
         }
         self
@@ -208,6 +288,20 @@ impl<'a, T: ?Sized + 'static> Request<'a, Option<&'a T>> {
     ///
     /// The returned value will unsize to `Request<'a>`, and can be passed to
     /// functions accepting it as an argument to request `&'a T` references.
+    ///
+    /// See also the [`ObjectProviderExt`] trait, which provides the
+    /// `request_ref` helper method.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use object_provider::Request;
+    /// fn provider(request: &mut Request<'_>) { /* ... */ }
+    ///
+    /// let mut request = Request::<'_, Option<&str>>::new_ref();
+    /// provider(&mut request);
+    /// let response = request.into_response();
+    /// ```
     pub fn new_ref() -> Self {
         // safety: Initializes `type_id` to `RefMarker<T>`, which corresponds to
         // the response type `Option<&'a T>`.
@@ -224,6 +318,20 @@ impl<T: 'static> Request<'_, Option<T>> {
     ///
     /// The returned value will unsize to `Request<'a>`, and can be passed to
     /// functions accepting it as an argument to request `T` values.
+    ///
+    /// See also the [`ObjectProviderExt`] trait, which provides the
+    /// `request_value` helper method.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use object_provider::Request;
+    /// fn provider(request: &mut Request<'_>) { /* ... */ }
+    ///
+    /// let mut request = Request::<'_, Option<String>>::new_value();
+    /// provider(&mut request);
+    /// let response = request.into_response();
+    /// ```
     pub fn new_value() -> Self {
         // safety: Initializes `type_id` to `ValueMarker<T>`, which corresponds
         // to the response type `Option<T>`.
