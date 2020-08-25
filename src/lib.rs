@@ -73,34 +73,32 @@ use core::any::TypeId;
 use core::marker::PhantomData;
 
 mod private {
-    pub trait Response {}
-    impl<T> Response for Option<T> {}
+    pub trait Response<'a>: 'a {}
 }
 
-/// When used by `Request`, `TypeId::of::<RefMarker<T>>()` indicates that
-/// `response` is of type `Option<&'a T>`.
-struct RefMarker<T: ?Sized + 'static>(T);
+/// A response to a ref request.
+struct RefResponse<'a, T: ?Sized + 'static>(Option<&'a T>);
+impl<'a, T: ?Sized + 'static> private::Response<'a> for RefResponse<'a, T> {}
 
-/// When used by `Request`, `TypeId::of::<ValueMarker<T>>()` indicates that
-/// `response` is of type `Option<T>`.
-struct ValueMarker<T: 'static>(T);
+/// A response to a value request.
+struct ValueResponse<T: 'static>(Option<T>);
+impl<'a, T: 'static> private::Response<'a> for ValueResponse<T> {}
 
 /// A dynamic request for an object based on its type.
-pub struct Request<'a, R = dyn private::Response + 'a>
+pub struct Request<'a, R = dyn private::Response<'a>>
 where
-    R: ?Sized + private::Response,
+    R: ?Sized + private::Response<'a>,
 {
     marker: PhantomData<&'a ()>,
 
     /// A `TypeId` marker for the type stored in `R`.
     ///
-    /// Will be the TypeId of either `RefMarker<T>` or `ValueMarker<T>`.
+    /// Will be the TypeId of either `RefResponse<'static, T>` or
+    /// `ValueResponse<T>`.
     type_id: TypeId,
 
-    /// A (potentially type-erased) `Option<T>` containing the response value.
-    ///
-    /// Will be either `Option<&'a T>` if `type_id` is `RefMarker<T>`, or
-    /// `Option<T>` if `type_id` is `ValueMarker<T>`.
+    /// A type erased `RefResponse` or `ValueResponse` containing the response
+    /// value.
     response: R,
 }
 
@@ -108,24 +106,24 @@ impl<'a> Request<'a> {
     /// Perform a checked downcast of `response` to `Option<&'a T>`
     fn downcast_ref_response<'b, T: ?Sized + 'static>(
         &'b mut self,
-    ) -> Option<&'b mut Option<&'a T>> {
+    ) -> Option<&'b mut RefResponse<'a, T>> {
         if self.is_ref::<T>() {
             // safety: If `self.is_ref::<T>()` returns true, `response` must be
             // of the correct type. This is enforced by the private `type_id`
             // field.
-            Some(unsafe { &mut *(&mut self.response as *mut _ as *mut Option<&'a T>) })
+            Some(unsafe { &mut *(&mut self.response as *mut _ as *mut RefResponse<'a, T>) })
         } else {
             None
         }
     }
 
     /// Perform a checked downcast of `response` to `Option<T>`
-    fn downcast_value_response<'b, T: 'static>(&'b mut self) -> Option<&'b mut Option<T>> {
+    fn downcast_value_response<'b, T: 'static>(&'b mut self) -> Option<&'b mut ValueResponse<T>> {
         if self.is_value::<T>() {
             // safety: If `self.is_value::<T>()` returns true, `response` must
             // be of the correct type. This is enforced by the private `type_id`
             // field.
-            Some(unsafe { &mut *(&mut self.response as *mut _ as *mut Option<T>) })
+            Some(unsafe { &mut *(&mut self.response as *mut _ as *mut ValueResponse<T>) })
         } else {
             None
         }
@@ -201,7 +199,7 @@ impl<'a> Request<'a> {
     where
         F: FnOnce() -> &'a T,
     {
-        if let Some(response @ None) = self.downcast_ref_response::<T>() {
+        if let Some(RefResponse(response @ None)) = self.downcast_ref_response::<T>() {
             *response = Some(cb());
         }
         self
@@ -266,7 +264,7 @@ impl<'a> Request<'a> {
     where
         F: FnOnce() -> T,
     {
-        if let Some(response @ None) = self.downcast_value_response::<T>() {
+        if let Some(ValueResponse(response @ None)) = self.downcast_value_response::<T>() {
             *response = Some(cb());
         }
         self
@@ -274,79 +272,94 @@ impl<'a> Request<'a> {
 
     /// Returns `true` if the requested type is `&'a T`
     pub fn is_ref<T: ?Sized + 'static>(&self) -> bool {
-        self.type_id == TypeId::of::<RefMarker<T>>()
+        self.type_id == TypeId::of::<RefResponse<'static, T>>()
     }
 
     /// Returns `true` if the requested type is `T`
     pub fn is_value<T: 'static>(&self) -> bool {
-        self.type_id == TypeId::of::<ValueMarker<T>>()
+        self.type_id == TypeId::of::<ValueResponse<T>>()
+    }
+
+    /// Calls the provided closure with a request for the the type `&'a T`,
+    /// returning `Some(&T)` if the request was fulfilled, and `None` otherwise.
+    ///
+    /// The `ObjectProviderExt` trait provides helper methods specifically for
+    /// types implementing `ObjectProvider`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use object_provider::Request;
+    /// let response: Option<&str> = Request::request_ref(|request| {
+    ///     // ...
+    ///     request.provide_ref::<str>("hello, world");
+    /// });
+    /// assert_eq!(response, Some("hello, world"));
+    /// ```
+    pub fn request_ref<T: ?Sized + 'static, F>(cb: F) -> Option<&'a T>
+    where
+        F: FnOnce(&mut Request<'a>),
+    {
+        let mut request = Request::new_ref();
+        cb(&mut request);
+        request.response.0
+    }
+
+    /// Calls the provided closure with a request for the the type `T`,
+    /// returning `Some(T)` if the request was fulfilled, and `None` otherwise.
+    ///
+    /// The `ObjectProviderExt` trait provides helper methods specifically for
+    /// types implementing `ObjectProvider`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use object_provider::Request;
+    /// let response: Option<i32> = Request::request_value(|request| {
+    ///     // ...
+    ///     request.provide_value::<i32>(5);
+    /// });
+    /// assert_eq!(response, Some(5));
+    /// ```
+    pub fn request_value<T: 'static, F>(cb: F) -> Option<T>
+    where
+        F: FnOnce(&mut Request<'a>),
+    {
+        let mut request = Request::new_value();
+        cb(&mut request);
+        request.response.0
     }
 }
 
-impl<'a, T: ?Sized + 'static> Request<'a, Option<&'a T>> {
+impl<'a, T: ?Sized + 'static> Request<'a, RefResponse<'a, T>> {
     /// Create a new reference request object.
     ///
     /// The returned value will unsize to `Request<'a>`, and can be passed to
     /// functions accepting it as an argument to request `&'a T` references.
-    ///
-    /// See also the [`ObjectProviderExt`] trait, which provides the
-    /// `request_ref` helper method.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use object_provider::Request;
-    /// fn provider(request: &mut Request<'_>) { /* ... */ }
-    ///
-    /// let mut request = Request::<'_, Option<&str>>::new_ref();
-    /// provider(&mut request);
-    /// let response = request.into_response();
-    /// ```
-    pub fn new_ref() -> Self {
-        // safety: Initializes `type_id` to `RefMarker<T>`, which corresponds to
-        // the response type `Option<&'a T>`.
+    fn new_ref() -> Self {
+        // safety: Initializes `type_id` to `RefResponse<'static, T>`, which
+        // corresponds to the response type `RefResponse<'a, T>`.
         Request {
             marker: PhantomData,
-            type_id: TypeId::of::<RefMarker<T>>(),
-            response: None,
+            type_id: TypeId::of::<RefResponse<'static, T>>(),
+            response: RefResponse(None),
         }
     }
 }
 
-impl<T: 'static> Request<'_, Option<T>> {
+impl<T: 'static> Request<'_, ValueResponse<T>> {
     /// Create a new value request object.
     ///
     /// The returned value will unsize to `Request<'a>`, and can be passed to
     /// functions accepting it as an argument to request `T` values.
-    ///
-    /// See also the [`ObjectProviderExt`] trait, which provides the
-    /// `request_value` helper method.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use object_provider::Request;
-    /// fn provider(request: &mut Request<'_>) { /* ... */ }
-    ///
-    /// let mut request = Request::<'_, Option<String>>::new_value();
-    /// provider(&mut request);
-    /// let response = request.into_response();
-    /// ```
-    pub fn new_value() -> Self {
-        // safety: Initializes `type_id` to `ValueMarker<T>`, which corresponds
-        // to the response type `Option<T>`.
+    fn new_value() -> Self {
+        // safety: Initializes `type_id` to `ValueResponse<T>`, which
+        // corresponds to the response type `ValueResponse<T>`.
         Request {
             marker: PhantomData,
-            type_id: TypeId::of::<ValueMarker<T>>(),
-            response: None,
+            type_id: TypeId::of::<ValueResponse<T>>(),
+            response: ValueResponse(None),
         }
-    }
-}
-
-impl<T> Request<'_, Option<T>> {
-    /// Extract the response from this request object, consuming it.
-    pub fn into_response(self) -> Option<T> {
-        self.response
     }
 }
 
@@ -370,15 +383,11 @@ pub trait ObjectProviderExt {
 
 impl<O: ?Sized + ObjectProvider> ObjectProviderExt for O {
     fn request_ref<T: ?Sized + 'static>(&self) -> Option<&T> {
-        let mut request = Request::new_ref();
-        self.provide(&mut request);
-        request.into_response()
+        Request::request_ref(|request| self.provide(request))
     }
 
     fn request_value<T: 'static>(&self) -> Option<T> {
-        let mut request = Request::new_value();
-        self.provide(&mut request);
-        request.into_response()
+        Request::request_value(|request| self.provide(request))
     }
 }
 
